@@ -377,3 +377,12 @@ func (c *JsonClient) Remove(path []string) error {
 
 	return nil
 }
+
+func parseJson(str []byte) (interface{}, error) {
+	var res interface{}
+	err := json.Unmarshal(str, &res)
+	if err != nil {
+		return res, fmt.Errorf("JSON unmarshalling error: %v", err)
+	}
+	return res, nil
+}

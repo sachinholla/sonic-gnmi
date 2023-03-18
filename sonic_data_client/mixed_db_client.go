@@ -1,3 +1,6 @@
+//go:build !noswss
+// +build !noswss
+
 package client
 
 // #cgo pkg-config: python3-embed
@@ -64,15 +67,6 @@ type MixedDbClient struct {
 	synced sync.WaitGroup  // Control when to send gNMI sync_response
 	w      *sync.WaitGroup // wait for all sub go routines to finish
 	mu     sync.RWMutex    // Mutex for data protection among routines for DbClient
-}
-
-func parseJson(str []byte) (interface{}, error) {
-	var res interface{}
-	err := json.Unmarshal(str, &res)
-	if err != nil {
-		return res, fmt.Errorf("JSON unmarshalling error: %v", err)
-	}
-	return res, nil
 }
 
 func ParseTarget(target string, paths []*gnmipb.Path) (string, error) {

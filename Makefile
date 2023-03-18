@@ -19,11 +19,18 @@ SRC_FILES=$(shell find . -name '*.go' | grep -v '_test.go' | grep -v '/tests/')
 TEST_FILES=$(wildcard *_test.go)
 TELEMETRY_TEST_DIR = build/tests/gnmi_server
 TELEMETRY_TEST_BIN = $(TELEMETRY_TEST_DIR)/server.test
+SWSSWRAP=swsscommon_wrap
+
 ifeq ($(ENABLE_TRANSLIB_WRITE),y)
 BLD_TAGS := gnmi_translib_write
 endif
 ifeq ($(ENABLE_NATIVE_WRITE),y)
 BLD_TAGS := $(BLD_TAGS) gnmi_native_write
+endif
+ifeq ($(NOSWSS),y)
+BLD_TAGS := $(BLD_TAGS) noswss
+undefine SWSSWRAP
+unexport CGO_LDFLAGS CGO_CXXFLAGS
 endif
 
 ifneq ($(BLD_TAGS),)
@@ -39,7 +46,7 @@ all: sonic-gnmi $(TELEMETRY_TEST_BIN)
 go.mod:
 	$(GO) mod init github.com/sonic-net/sonic-gnmi
 
-$(GO_DEPS): go.mod $(PATCHES) swsscommon_wrap
+$(GO_DEPS): go.mod $(PATCHES) $(SWSSWRAP)
 	$(GO) mod vendor
 	$(GO) mod download golang.org/x/crypto@v0.0.0-20191206172530-e9b2fee46413
 	$(GO) mod download github.com/jipanyang/gnxi@v0.0.0-20181221084354-f0a90cca6fd0
@@ -78,6 +85,13 @@ else
 	$(GO) install -mod=vendor github.com/sonic-net/sonic-gnmi/gnoi_client
 	$(GO) install -mod=vendor github.com/sonic-net/sonic-gnmi/gnmi_dump
 endif
+
+# telemetry is a special target to recompile the server and clients after sonic-gnmi or
+# sonic-mgmt-common code changes. Useful for quick testing in the development env.
+# Not to be called during docker build.
+telemetry: go-deps-clean
+	$(MAKE) -C $(MGMT_COMMON_DIR) CGO_LDFLAGS= CGO_CFLAGS= CGO_CXXFLAGS=
+	$(MAKE) sonic-gnmi NOSWSS=y ENABLE_TRANSLIB_WRITE=y
 
 swsscommon_wrap:
 	make -C swsscommon
