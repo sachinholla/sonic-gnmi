@@ -341,6 +341,12 @@ func ValToResp(val Value) (*gnmipb.SubscribeResponse, error) {
 			return nil, fmt.Errorf("%s", fatal)
 		}
 
+		// In case the client returned a full gnmipb.Notification object
+		if n := val.GetNotification(); n != nil {
+			return &gnmipb.SubscribeResponse{
+				Response: &gnmipb.SubscribeResponse_Update{Update: n}}, nil
+		}
+
 		return &gnmipb.SubscribeResponse{
 			Response: &gnmipb.SubscribeResponse_Update{
 				Update: &gnmipb.Notification{
