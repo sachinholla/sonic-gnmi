@@ -1,23 +1,26 @@
-//  Package client provides a generic access layer for data available in system
+// Package client provides a generic access layer for data available in system
 package client
 
 import (
-	spb "github.com/sonic-net/sonic-gnmi/proto"
-	transutil "github.com/sonic-net/sonic-gnmi/transl_utils"
+	"context"
+	"fmt"
+	"reflect"
+	"runtime"
+	"sync"
+	"time"
+
+	"github.com/Azure/sonic-mgmt-common/translib"
+	"github.com/Workiva/go-datastructures/queue"
 	log "github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 	gnmi_extpb "github.com/openconfig/gnmi/proto/gnmi_ext"
-	"github.com/Workiva/go-datastructures/queue"
-	"sync"
-	"time"
-	"fmt"
-	"reflect"
-	"github.com/Azure/sonic-mgmt-common/translib"
+	"github.com/openconfig/ygot/ygot"
 	"github.com/sonic-net/sonic-gnmi/common_utils"
-	"bytes"
-	"encoding/json"
-	"context"
+	spb "github.com/sonic-net/sonic-gnmi/proto"
+	transutil "github.com/sonic-net/sonic-gnmi/transl_utils"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -33,11 +36,14 @@ type TranslClient struct {
 	channel  chan struct{}
 	q        *queue.PriorityQueue
 
-	synced sync.WaitGroup  // Control when to send gNMI sync_response
-	w      *sync.WaitGroup // wait for all sub go routines to finish
-	mu     sync.RWMutex    // Mutex for data protection among routines for transl_client
-	ctx context.Context //Contains Auth info and request info
+	synced     sync.WaitGroup  // Control when to send gNMI sync_response
+	w          *sync.WaitGroup // wait for all sub go routines to finish
+	mu         sync.RWMutex    // Mutex for data protection among routines for transl_client
+	ctx        context.Context //Contains Auth info and request info
 	extensions []*gnmi_extpb.Extension
+
+	version  *translib.Version // Client version; populated by parseVersion()
+	encoding gnmipb.Encoding
 }
 
 func NewTranslClient(prefix *gnmipb.Path, getpaths []*gnmipb.Path, ctx context.Context, extensions []*gnmi_extpb.Extension) (Client, error) {
@@ -126,6 +132,7 @@ func (c *TranslClient) Set(delete []*gnmipb.Path, replace []*gnmipb.Update, upda
 	}
 	return nil
 }
+
 func enqueFatalMsgTranslib(c *TranslClient, msg string) {
 	c.q.Put(Value{
 		&spb.Value{
@@ -134,42 +141,117 @@ func enqueFatalMsgTranslib(c *TranslClient, msg string) {
 		},
 	})
 }
-type ticker_info struct{
-	t              *time.Ticker
-	sub            *gnmipb.Subscription
-	heartbeat      bool
+
+func enqueueSyncMessage(c *TranslClient) {
+	m := &spb.Value{
+		Timestamp:    time.Now().UnixNano(),
+		SyncResponse: true,
+	}
+	c.q.Put(Value{m})
+}
+
+// recoverSubscribe recovers from possible panics during subscribe handling.
+// It pushes a fatal message to the RPC handler's queue, which will force it to
+// close the RPC with an error status. Should always be used as a deferred function.
+func recoverSubscribe(c *TranslClient) {
+	if r := recover(); r != nil {
+		buff := make([]byte, 1<<12)
+		buff = buff[:runtime.Stack(buff, false)]
+		log.Error(string(buff))
+
+		err := status.Errorf(codes.Internal, "%v", r)
+		enqueFatalMsgTranslib(c, fmt.Sprintf("Subscribe operation failed with error =%v", err.Error()))
+	}
+}
+
+type ticker_info struct {
+	t         *time.Ticker
+	sub       *gnmipb.Subscription
+	pathStr   string
+	heartbeat bool
+}
+
+func getTranslNotificationType(mode gnmipb.SubscriptionMode) translib.NotificationType {
+	switch mode {
+	case gnmipb.SubscriptionMode_ON_CHANGE:
+		return translib.OnChange
+	case gnmipb.SubscriptionMode_SAMPLE:
+		return translib.Sample
+	default:
+		return translib.TargetDefined
+	}
+}
+
+func tickerCleanup(ticker_map map[int][]*ticker_info, c *TranslClient) {
+	for _, v := range ticker_map {
+		for _, ti := range v {
+			fmt.Println("Ticker Cleanup: ", ti.pathStr)
+			ti.t.Stop()
+		}
+	}
 }
 
 func (c *TranslClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *sync.WaitGroup, subscribe *gnmipb.SubscriptionList) {
-	rc, ctx := common_utils.GetContext(c.ctx)
-	c.ctx = ctx
 	c.w = w
 
 	defer c.w.Done()
+	defer recoverSubscribe(c)
+
 	c.q = q
 	c.channel = stop
-	version := getBundleVersion(c.extensions)
-	if version != nil {
-		rc.BundleVersion = version
+
+	if err := c.parseVersion(); err != nil {
+		enqueFatalMsgTranslib(c, err.Error())
+		return
 	}
 
 	ticker_map := make(map[int][]*ticker_info)
+
+	defer tickerCleanup(ticker_map, c)
 	var cases []reflect.SelectCase
 	cases_map := make(map[int]int)
 	var subscribe_mode gnmipb.SubscriptionMode
-	stringPaths := make([]string, len(subscribe.Subscription))
-	for i,sub := range subscribe.Subscription {
-		stringPaths[i] = c.path2URI[sub.Path]
-	}
-	req := translib.IsSubscribeRequest{Paths:stringPaths}
-	subSupport,_ := translib.IsSubscribeSupported(req)
-	var onChangeSubsString []string
-	var onChangeSubsgNMI []*gnmipb.Path
-	onChangeMap := make(map[string]*gnmipb.Path)
-	valueCache := make(map[string]string)
+	translPaths := make([]translib.IsSubscribePath, len(subscribe.Subscription))
+	sampleCache := make(map[string]*ygotCache)
 
-	for i,sub := range subscribe.Subscription {
-		fmt.Println(sub.Mode, sub.SampleInterval)
+	for i, sub := range subscribe.Subscription {
+		translPaths[i].ID = uint32(i)
+		translPaths[i].Path = c.path2URI[sub.Path]
+		translPaths[i].Mode = getTranslNotificationType(sub.Mode)
+	}
+
+	rc, _ := common_utils.GetContext(c.ctx)
+	ss := translib.NewSubscribeSession()
+	defer ss.Close()
+
+	req := translib.IsSubscribeRequest{
+		Paths:   translPaths,
+		Session: ss,
+		User:    translib.UserRoles{Name: rc.Auth.User, Roles: rc.Auth.Roles},
+	}
+	if c.version != nil {
+		req.ClientVersion = *c.version
+	}
+	log.V(2).Infof("Running IsSubscribeRequest with: %v", req)
+	subSupport, err := translib.IsSubscribeSupported(req)
+	if err != nil {
+		enqueFatalMsgTranslib(c, fmt.Sprintf("Subscribe operation failed with error =%v", err.Error()))
+		return
+	}
+	log.V(2).Infof("Ran IsSubscribeRequest got: %v", subSupport)
+	var onChangeSubsString []string
+
+	for i, resp := range subSupport {
+		sub := subscribe.Subscription[resp.ID]
+		log.Infof("Start Sub: %v", sub)
+		pathStr := resp.Path
+		reqPath := sub.Path
+		if i != int(resp.ID) { // additional subscriptions created for target_defined
+			reqPath, _ = ygot.StringToStructuredPath(pathStr)
+		}
+
+		log.V(6).Infof("%s %s", sub.Mode, sub.SampleInterval)
+
 		switch sub.Mode {
 
 		case gnmipb.SubscriptionMode_TARGET_DEFINED:
@@ -186,227 +268,138 @@ func (c *TranslClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *
 
 		case gnmipb.SubscriptionMode_ON_CHANGE:
 			if subSupport[i].Err == nil && subSupport[i].IsOnChangeSupported {
-				if (subSupport[i].MinInterval > 0) {
+				if subSupport[i].MinInterval > 0 {
 					subscribe_mode = gnmipb.SubscriptionMode_ON_CHANGE
-				}else{
-					enqueFatalMsgTranslib(c, fmt.Sprintf("Invalid subscribe path %v", stringPaths[i]))
+				} else {
+					//FIXME have an error type to indicate invalid paths
+					enqueFatalMsgTranslib(c, fmt.Sprintf("Invalid subscribe path %v", pathStr))
 					return
 				}
 			} else {
-				enqueFatalMsgTranslib(c, fmt.Sprintf("ON_CHANGE Streaming mode invalid for %v", stringPaths[i]))
+				enqueFatalMsgTranslib(c, fmt.Sprintf("ON_CHANGE Streaming mode invalid for %v", pathStr))
 				return
 			}
 		case gnmipb.SubscriptionMode_SAMPLE:
-			if (subSupport[i].MinInterval > 0) {
+			if subSupport[i].MinInterval > 0 {
 				subscribe_mode = gnmipb.SubscriptionMode_SAMPLE
-			}else{
-				enqueFatalMsgTranslib(c, fmt.Sprintf("Invalid subscribe path %v", stringPaths[i]))
+			} else {
+				enqueFatalMsgTranslib(c, fmt.Sprintf("Invalid subscribe path %v", pathStr))
 				return
 			}
 		default:
-			log.V(1).Infof("Bad Subscription Mode for client %v ", c)
+			log.V(1).Infof("Bad Subscription Mode for client %s ", c)
 			enqueFatalMsgTranslib(c, fmt.Sprintf("Invalid Subscription Mode %d", sub.Mode))
 			return
 		}
-		fmt.Println("subscribe_mode:", subscribe_mode)
+
+		log.V(6).Infof("subscribe_mode:", subscribe_mode)
 		if subscribe_mode == gnmipb.SubscriptionMode_SAMPLE {
 			interval := int(sub.SampleInterval)
 			if interval == 0 {
 				interval = subSupport[i].MinInterval * int(time.Second)
 			} else {
-				if interval < (subSupport[i].MinInterval*int(time.Second)) {
+				if interval < (subSupport[i].MinInterval * int(time.Second)) {
 					enqueFatalMsgTranslib(c, fmt.Sprintf("Invalid Sample Interval %ds, minimum interval is %ds", interval/int(time.Second), subSupport[i].MinInterval))
 					return
 				}
 			}
-			if !subscribe.UpdatesOnly {
-				//Send initial data now so we can send sync response.
-				val, err := transutil.TranslProcessGet(c.path2URI[sub.Path], nil, c.ctx)
-				if err != nil {
-					return
-				}
-				spbv := &spb.Value{
-					Prefix:       c.prefix,
-					Path:         sub.Path,
-					Timestamp:    time.Now().UnixNano(),
-					SyncResponse: false,
-					Val:          val,
-				}
-				c.q.Put(Value{spbv})
-				valueCache[c.path2URI[sub.Path]] = string(val.GetJsonIetfVal())
+
+			yCache := newYgotCache(reqPath)
+			sampleCache[pathStr] = yCache
+			ts := translSubscriber{
+				client:      c,
+				session:     ss,
+				sampleCache: yCache,
+				filterMsgs:  subscribe.UpdatesOnly,
 			}
 
-			addTimer(c, ticker_map, &cases, cases_map, interval, sub, false)
+			// Force ignore init updates for subpaths to prevent duplicates.
+			// But performs duplicate gets though -- needs optimization.
+			if resp.IsSubPath {
+				ts.filterMsgs = true
+			}
 
+			// do initial sync & build the cache
+			ts.doSample(pathStr)
+
+			addTimer(c, ticker_map, &cases, cases_map, interval, sub, pathStr, false)
 			//Heartbeat intervals are valid for SAMPLE in the case suppress_redundant is specified
 			if sub.SuppressRedundant && sub.HeartbeatInterval > 0 {
-				if int(sub.HeartbeatInterval) < subSupport[i].MinInterval * int(time.Second) {
+				if int(sub.HeartbeatInterval) < subSupport[i].MinInterval*int(time.Second) {
 					enqueFatalMsgTranslib(c, fmt.Sprintf("Invalid Heartbeat Interval %ds, minimum interval is %ds", int(sub.HeartbeatInterval)/int(time.Second), subSupport[i].MinInterval))
 					return
 				}
-				addTimer(c, ticker_map, &cases, cases_map, int(sub.HeartbeatInterval), sub, true)
+				addTimer(c, ticker_map, &cases, cases_map, int(sub.HeartbeatInterval), sub, pathStr, true)
 			}
 		} else if subscribe_mode == gnmipb.SubscriptionMode_ON_CHANGE {
-			onChangeSubsString = append(onChangeSubsString, c.path2URI[sub.Path])
-			onChangeSubsgNMI = append(onChangeSubsgNMI, sub.Path)
-			onChangeMap[c.path2URI[sub.Path]] = sub.Path
+			onChangeSubsString = append(onChangeSubsString, pathStr)
 			if sub.HeartbeatInterval > 0 {
-				if int(sub.HeartbeatInterval) < subSupport[i].MinInterval * int(time.Second) {
+				if int(sub.HeartbeatInterval) < subSupport[i].MinInterval*int(time.Second) {
 					enqueFatalMsgTranslib(c, fmt.Sprintf("Invalid Heartbeat Interval %ds, minimum interval is %ds", int(sub.HeartbeatInterval)/int(time.Second), subSupport[i].MinInterval))
 					return
 				}
-				addTimer(c, ticker_map, &cases, cases_map, int(sub.HeartbeatInterval), sub, true)
+				addTimer(c, ticker_map, &cases, cases_map, int(sub.HeartbeatInterval), sub, pathStr, true)
 			}
-			
 		}
+		log.Infof("End Sub: %v", sub)
 	}
-	if len(onChangeSubsString) > 0 {
-		c.w.Add(1)
-		c.synced.Add(1)
-		go TranslSubscribe(onChangeSubsgNMI, onChangeSubsString, onChangeMap, c, subscribe.UpdatesOnly)
 
+	if len(onChangeSubsString) > 0 {
+		ts := translSubscriber{
+			client:     c,
+			session:    ss,
+			filterMsgs: subscribe.UpdatesOnly,
+		}
+		ts.doOnChange(onChangeSubsString)
+	} else {
+		// If at least one ON_CHANGE subscription was present, then
+		// ts.doOnChange() would have sent the sync message.
+		// Explicitly send one here if all are SAMPLE subscriptions.
+		enqueueSyncMessage(c)
 	}
-	// Wait until all data values corresponding to the path(s) specified
-	// in the SubscriptionList has been transmitted at least once
-	c.synced.Wait()
-	spbs := &spb.Value{
-		Timestamp:    time.Now().UnixNano(),
-		SyncResponse: true,
-	}
-	c.q.Put(Value{spbs})
+
 	cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(c.channel)})
 
 	for {
 		chosen, _, ok := reflect.Select(cases)
-
-
 		if !ok {
 			return
 		}
 
-		for _,tick := range ticker_map[cases_map[chosen]] {
-			fmt.Printf("tick, heartbeat: %t, path: %s", tick.heartbeat, c.path2URI[tick.sub.Path])
-			val, err := transutil.TranslProcessGet(c.path2URI[tick.sub.Path], nil, c.ctx)
-			if err != nil {
-				return
+		for _, tick := range ticker_map[cases_map[chosen]] {
+			log.V(6).Infof("tick, heartbeat: %t, path: %s\n", tick.heartbeat, c.path2URI[tick.sub.Path])
+			ts := translSubscriber{
+				client:      c,
+				session:     ss,
+				sampleCache: sampleCache[tick.pathStr],
+				filterDups:  (!tick.heartbeat && tick.sub.SuppressRedundant),
 			}
-			spbv := &spb.Value{
-				Prefix:       c.prefix,
-				Path:         tick.sub.Path,
-				Timestamp:    time.Now().UnixNano(),
-				SyncResponse: false,
-				Val:          val,
-			}
-			
-
-			if (tick.sub.SuppressRedundant) && (!tick.heartbeat) && (string(val.GetJsonIetfVal()) == valueCache[c.path2URI[tick.sub.Path]]) {
-				log.V(6).Infof("Redundant Message Suppressed #%v", string(val.GetJsonIetfVal()))
-			} else {
-				c.q.Put(Value{spbv})
-				valueCache[c.path2URI[tick.sub.Path]] = string(val.GetJsonIetfVal())
-				log.V(6).Infof("Added spbv #%v", spbv)
-			}
-			
-			
+			ts.doSample(tick.pathStr)
 		}
 	}
 }
 
-func addTimer(c *TranslClient, ticker_map map[int][]*ticker_info, cases *[]reflect.SelectCase, cases_map map[int]int, interval int, sub *gnmipb.Subscription, heartbeat bool) {
+func addTimer(c *TranslClient, ticker_map map[int][]*ticker_info, cases *[]reflect.SelectCase, cases_map map[int]int, interval int, sub *gnmipb.Subscription, pathStr string, heartbeat bool) {
 	//Reuse ticker for same sample intervals, otherwise create a new one.
 	if ticker_map[interval] == nil {
 		ticker_map[interval] = make([]*ticker_info, 1, 1)
-		ticker_map[interval][0] = &ticker_info {
-			t: time.NewTicker(time.Duration(interval) * time.Nanosecond),
-			sub: sub,
+		ticker_map[interval][0] = &ticker_info{
+			t:         time.NewTicker(time.Duration(interval) * time.Nanosecond),
+			sub:       sub,
+			pathStr:   pathStr,
 			heartbeat: heartbeat,
 		}
 		cases_map[len(*cases)] = interval
 		*cases = append(*cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ticker_map[interval][0].t.C)})
-	}else {
-		ticker_map[interval] = append(ticker_map[interval], &ticker_info {
-			t: ticker_map[interval][0].t,
-			sub: sub,
+	} else {
+		ticker_map[interval] = append(ticker_map[interval], &ticker_info{
+			t:         ticker_map[interval][0].t,
+			sub:       sub,
+			pathStr:   pathStr,
 			heartbeat: heartbeat,
 		})
 	}
-	
-
 }
-
-func TranslSubscribe(gnmiPaths []*gnmipb.Path, stringPaths []string, pathMap map[string]*gnmipb.Path, c *TranslClient, updates_only bool) {
-	defer c.w.Done()
-	rc, ctx := common_utils.GetContext(c.ctx)
-	c.ctx = ctx
-	q := queue.NewPriorityQueue(1, false)
-	var sync_done bool
-	req := translib.SubscribeRequest{Paths:stringPaths, Q:q, Stop:c.channel}
-	if rc.BundleVersion != nil {
-		nver, err := translib.NewVersion(*rc.BundleVersion)
-		if err != nil {
-			log.V(2).Infof("Subscribe operation failed with error =%v", err.Error())
-			enqueFatalMsgTranslib(c, fmt.Sprintf("Subscribe operation failed with error =%v", err.Error()))
-			return
-		}
-		req.ClientVersion = nver
-	}
-	translib.Subscribe(req)
-	for {
-		items, err := q.Get(1)
-		if err != nil {
-			log.V(1).Infof("%v", err)
-			return
-		}
-		switch v := items[0].(type) {
-		case *translib.SubscribeResponse:
-
-			if v.IsTerminated {
-				//DB Connection or other backend error
-				enqueFatalMsgTranslib(c, "DB Connection Error")
-				close(c.channel)
-				return
-			}
-
-			var jv []byte
-			dst := new(bytes.Buffer)
-			json.Compact(dst, v.Payload)
-			jv = dst.Bytes()
-
-			/* Fill the values into GNMI data structures . */
-			val := &gnmipb.TypedValue{
-				Value: &gnmipb.TypedValue_JsonIetfVal{
-				JsonIetfVal: jv,
-				}}
-
-			spbv := &spb.Value{
-				Prefix:       c.prefix,
-				Path:         pathMap[v.Path],
-				Timestamp:    v.Timestamp,
-				SyncResponse: false,
-				Val:          val,
-			}
-
-			//Don't send initial update with full object if user wants updates only.
-			if updates_only && !sync_done {
-				log.V(1).Infof("Msg suppressed due to updates_only")
-			} else {
-				c.q.Put(Value{spbv})
-			}
-
-			log.V(6).Infof("Added spbv #%v", spbv)
-			
-			if v.SyncComplete && !sync_done {
-				fmt.Println("SENDING SYNC")
-				c.synced.Done()
-				sync_done = true
-			}
-		default:
-			log.V(1).Infof("Unknown data type %v for %v in queue", items[0], v)
-		}
-	}
-}
-
-
 
 func (c *TranslClient) PollRun(q *queue.PriorityQueue, poll chan struct{}, w *sync.WaitGroup, subscribe *gnmipb.SubscriptionList) {
 	rc, ctx := common_utils.GetContext(c.ctx)
@@ -502,7 +495,7 @@ func (c *TranslClient) OnceRun(q *queue.PriorityQueue, once chan struct{}, w *sy
 		},
 	})
 	log.V(4).Infof("Sync done, once time taken: %v ms", int64(time.Since(t1)/time.Millisecond))
-	
+
 }
 
 func (c *TranslClient) Capabilities() []gnmipb.ModelData {
@@ -526,18 +519,36 @@ func (c *TranslClient) SentOne(val *Value) {
 func (c *TranslClient) FailedSend() {
 }
 
-
 func getBundleVersion(extensions []*gnmi_extpb.Extension) *string {
-	for _,e := range extensions {
+	for _, e := range extensions {
 		switch v := e.Ext.(type) {
-			case *gnmi_extpb.Extension_RegisteredExt:
-				if v.RegisteredExt.Id == spb.BUNDLE_VERSION_EXT {
-					var bv spb.BundleVersion
-					proto.Unmarshal(v.RegisteredExt.Msg, &bv)
-					return &bv.Version
-				}
-			
+		case *gnmi_extpb.Extension_RegisteredExt:
+			if v.RegisteredExt.Id == spb.BUNDLE_VERSION_EXT {
+				var bv spb.BundleVersion
+				proto.Unmarshal(v.RegisteredExt.Msg, &bv)
+				return &bv.Version
+			}
+
 		}
 	}
 	return nil
+}
+
+func (c *TranslClient) parseVersion() error {
+	bv := getBundleVersion(c.extensions)
+	if bv == nil {
+		return nil
+	}
+	v, err := translib.NewVersion(*bv)
+	if err != nil {
+		c.version = &v
+		return nil
+	}
+	log.V(4).Infof("Failed to parse version \"%s\"; err=%v", *bv, err)
+	return fmt.Errorf("Invalid bundle version: %v", *bv)
+}
+
+// Set the desired encoding for Get and Subcribe responses
+func (c *TranslClient) SetEncoding(enc gnmipb.Encoding) {
+	c.encoding = enc
 }
