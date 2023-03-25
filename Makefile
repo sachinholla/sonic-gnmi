@@ -12,8 +12,6 @@ BUILD_DIR := build/bin
 export CVL_SCHEMA_PATH := $(MGMT_COMMON_DIR)/build/cvl/schema
 export GOBIN := $(abspath $(BUILD_DIR))
 export PATH := $(PATH):$(GOBIN):$(shell dirname $(GO))
-export CGO_LDFLAGS := -lswsscommon -lhiredis
-export CGO_CXXFLAGS := -I/usr/include/swss -w -Wall -fpermissive
 
 SRC_FILES=$(shell find . -name '*.go' | grep -v '_test.go' | grep -v '/tests/')
 TEST_FILES=$(wildcard *_test.go)
@@ -27,10 +25,13 @@ endif
 ifeq ($(ENABLE_NATIVE_WRITE),y)
 BLD_TAGS := $(BLD_TAGS) gnmi_native_write
 endif
+
 ifeq ($(NOSWSS),y)
 BLD_TAGS := $(BLD_TAGS) noswss
 undefine SWSSWRAP
-unexport CGO_LDFLAGS CGO_CXXFLAGS
+else
+export CGO_LDFLAGS  := -lswsscommon -lhiredis
+export CGO_CXXFLAGS := -I/usr/include/swss -w -Wall -fpermissive
 endif
 
 ifneq ($(BLD_TAGS),)
@@ -90,8 +91,8 @@ endif
 # sonic-mgmt-common code changes. Useful for quick testing in the development env.
 # Not to be called during docker build.
 telemetry: go-deps-clean
-	$(MAKE) -C $(MGMT_COMMON_DIR) CGO_LDFLAGS= CGO_CFLAGS= CGO_CXXFLAGS=
-	$(MAKE) sonic-gnmi NOSWSS=y ENABLE_TRANSLIB_WRITE=y
+	$(MAKE) -C $(MGMT_COMMON_DIR)
+	$(MAKE) sonic-gnmi ENABLE_TRANSLIB_WRITE=y
 
 swsscommon_wrap:
 	make -C swsscommon
