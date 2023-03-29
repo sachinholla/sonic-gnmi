@@ -26,6 +26,7 @@ ARGV=()
 
 for V in "$@"; do
     case "$V" in
+    -port|--port|-port=*|--port=*) HAS_PORT=1 ;;
     -v|--v|-v=*|--v=*) HAS_V=1 ;;
     -*logto*|--*logto*|-log_dir*|--log_dir*) HAS_LOG=1;;
     -server_crt|--server_crt|-server_crt=*|--server_crt=*) HAS_CERT=1 ;;
@@ -45,6 +46,7 @@ if [[ ! -f ${TELEMETRY_BIN} ]]; then
 fi
 
 EXTRA_ARGS=()
+[[ -z ${HAS_PORT} ]] && EXTRA_ARGS+=( -port 8080 )
 [[ -z ${HAS_LOG}  ]] && EXTRA_ARGS+=( -logtostderr )
 [[ -z ${HAS_V} ]]    && EXTRA_ARGS+=( -v 2 )
 [[ -z ${HAS_CERT} ]] && EXTRA_ARGS+=( -insecure )
