@@ -29,6 +29,7 @@ OPTIONS:
   -port PORT        Server port (default 8080)
   -proto            Use PROTO encoding
   -user USER:PASS   Username and password for authentication
+  -origin ORIGIN    Origin to be prefixed to subsequent paths
 
 EOM
 }
@@ -47,6 +48,7 @@ HOST=localhost
 PORT=8080
 ARGS=()
 PATHS=()
+ORIGN=
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -65,8 +67,11 @@ while [[ $# -gt 0 ]]; do
     -proto|--proto)
         ARGS+=( -encoding PROTO )
         shift;;
+    -origin|--origin)
+        ORIGN=$2
+        shift 2;;
     [/_a-zA-Z]*)
-        PATHS+=( -xpath "$1" )
+        PATHS+=( -xpath "/${ORIGN}:${1#/}" )
         shift;;
     --)
         shift

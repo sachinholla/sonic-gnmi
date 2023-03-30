@@ -28,6 +28,7 @@ OPTIONS:
   -host HOST          Server IP address (default 127.0.0.1)
   -port PORT          Server port (default 8080)
   -user USER:PASS     Username and password for authentication
+  -origin ORIGIN      Origin to be prefixed to subsequent paths
 
 OPERATION: (can be repeated)
   -delete  PATH       Delete path
@@ -50,6 +51,7 @@ fi
 HOST=localhost
 PORT=8080
 ARGS=()
+ORIGIN=
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -65,18 +67,21 @@ while [[ $# -gt 0 ]]; do
     -u|-user|--user)
         ARGS+=( -username "${2%%:*}" -password "${2#*:}" )
         shift 2;;
+    -origin|--origin)
+        ORIGIN=$2
+        shift 2;;
     -D|-delete|--delete)
-        ARGS+=( -delete "$2" )
+        ARGS+=( -delete "/${ORIGIN}:${2#/}" )
         shift 2;;
     -U|-update|--update)
         F=$(mktemp -t 'u_XXXXX.json')
         echo "$3" > $F
-        ARGS+=( -update "/${2#/}:@$F" )
+        ARGS+=( -update "/${ORIGIN}:${2#/}:@$F" )
         shift 3;;
     -R|-replace|--replace)
         F=$(mktemp -t 'r_XXXXX.json')
         echo "$3" > $F
-        ARGS+=( -replace "/${2#/}:@$F" )
+        ARGS+=( -replace "/${ORIGIN}:${2#/}:@$F" )
         shift 3;;
     --)
         shift
