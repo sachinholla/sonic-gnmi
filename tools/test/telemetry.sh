@@ -26,13 +26,13 @@ if [[ ! -f ${TELEMETRY_BIN} ]]; then
 fi
 
 EXTRA_ARGS=()
-[[ -z ${HAS_PORT} ]] && EXTRA_ARGS+=( -port 8080 )
+[[ -z ${HAS_PORT} ]] && EXTRA_ARGS+=( --port=8080 )
 [[ -z ${HAS_LOG}  ]] && EXTRA_ARGS+=( -logtostderr )
-[[ -z ${HAS_V} ]]    && EXTRA_ARGS+=( -v 2 )
-[[ -z ${HAS_CERT} ]] && EXTRA_ARGS+=( -insecure )
-[[ -z ${HAS_AUTH} ]] && EXTRA_ARGS+=( -client_auth none )
+[[ -z ${HAS_V} ]]    && EXTRA_ARGS+=( -v=2 )
+[[ -z ${HAS_CERT} ]] && EXTRA_ARGS+=( --insecure )
+[[ -z ${HAS_AUTH} ]] && EXTRA_ARGS+=( --client_auth=none )
 
-EXTRA_ARGS+=( -allow_no_client_auth )
+EXTRA_ARGS+=( --allow_no_client_auth )
 
 set -x
 ${TELEMETRY_BIN} "${EXTRA_ARGS[@]}" "${ARGV[@]}"

@@ -1,3 +1,6 @@
+//go:build !noswss
+// +build !noswss
+
 package client
 
 // #cgo pkg-config: python3-embed
@@ -219,15 +222,6 @@ func IsTargetDbByDBKey(dbName string, dbkey swsscommon.SonicDBKey) bool {
 func GetTableKeySeparatorByDBKey(target string, dbkey swsscommon.SonicDBKey) (string, error) {
 	separator, err := sdcfg.GetDbSeparatorByDBKey(target, dbkey)
 	return separator, err
-}
-
-func parseJson(str []byte) (interface{}, error) {
-	var res interface{}
-	err := json.Unmarshal(str, &res)
-	if err != nil {
-		return res, fmt.Errorf("JSON unmarshalling error: %v", err)
-	}
-	return res, nil
 }
 
 func (c *MixedDbClient) GetTable(table string) (swsscommon.ProducerStateTable) {

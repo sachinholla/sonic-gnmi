@@ -1,3 +1,6 @@
+//go:build !noswss
+// +build !noswss
+
 package client
 
 /*

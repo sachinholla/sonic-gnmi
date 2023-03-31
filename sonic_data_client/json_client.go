@@ -1,11 +1,11 @@
 package client
 
 import (
-	"os"
-	"fmt"
-	"strconv"
-	"io/ioutil"
 	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"strconv"
 
 	log "github.com/golang/glog"
 )
@@ -85,9 +85,9 @@ func NewJsonClient(fileName string) (*JsonClient, error) {
 		return nil, err
 	}
 	defer jsonFile.Close()
- 
+
 	jsonData, err := ioutil.ReadAll(jsonFile)
-	if err!= nil {
+	if err != nil {
 		return nil, err
 	}
 	res, err := parseJson([]byte(jsonData))
@@ -293,7 +293,7 @@ func (c *JsonClient) Add(path []string, value string) error {
 		log.V(2).Infof("Invalid db table Path %v", path)
 		return fmt.Errorf("Invalid db table Path %v", path)
 	}
-		
+
 	return nil
 }
 
@@ -382,4 +382,13 @@ func (c *JsonClient) Remove(path []string) error {
 	}
 
 	return nil
+}
+
+func parseJson(str []byte) (interface{}, error) {
+	var res interface{}
+	err := json.Unmarshal(str, &res)
+	if err != nil {
+		return res, fmt.Errorf("JSON unmarshalling error: %v", err)
+	}
+	return res, nil
 }
