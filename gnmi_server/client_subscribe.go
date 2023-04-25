@@ -160,7 +160,7 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer) (err error) {
 		dc, err = sdc.NewDbClient(paths, prefix)
 	} else {
 		/* For any other target or no target create new Transl Client. */
-		dc, err = sdc.NewTranslClient(prefix, paths, ctx, extensions)
+		dc, err = sdc.NewTranslClient(prefix, paths, ctx, extensions, sdc.TranslWildcardOption{})
 	}
 
 	if err != nil {
