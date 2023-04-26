@@ -403,98 +403,67 @@ func addTimer(c *TranslClient, ticker_map map[int][]*ticker_info, cases *[]refle
 }
 
 func (c *TranslClient) PollRun(q *queue.PriorityQueue, poll chan struct{}, w *sync.WaitGroup, subscribe *gnmipb.SubscriptionList) {
-	rc, ctx := common_utils.GetContext(c.ctx)
-	c.ctx = ctx
 	c.w = w
 	defer c.w.Done()
+	defer recoverSubscribe(c)
 	c.q = q
 	c.channel = poll
-	version := getBundleVersion(c.extensions)
-	if version != nil {
-		rc.BundleVersion = version
+
+	if err := c.parseVersion(); err != nil {
+		enqueFatalMsgTranslib(c, err.Error())
+		return
 	}
+
 	synced := false
 	for {
 		_, more := <-c.channel
 		if !more {
 			log.V(1).Infof("%v poll channel closed, exiting pollDb routine", c)
+			enqueFatalMsgTranslib(c, "")
 			return
 		}
+
 		t1 := time.Now()
-		for gnmiPath, URIPath := range c.path2URI {
+		for _, gnmiPath := range c.path2URI {
 			if synced || !subscribe.UpdatesOnly {
-				val, err := transutil.TranslProcessGet(URIPath, nil, c.ctx)
-				if err != nil {
-					return
-				}
-
-				spbv := &spb.Value{
-					Prefix:       c.prefix,
-					Path:         gnmiPath,
-					Timestamp:    time.Now().UnixNano(),
-					SyncResponse: false,
-					Val:          val,
-				}
-
-				c.q.Put(Value{spbv})
-				log.V(6).Infof("Added spbv #%v", spbv)
+				ts := translSubscriber{client: c}
+				ts.doSample(gnmiPath)
 			}
 		}
 
-		c.q.Put(Value{
-			&spb.Value{
-				Timestamp:    time.Now().UnixNano(),
-				SyncResponse: true,
-			},
-		})
+		enqueueSyncMessage(c)
 		synced = true
 		log.V(4).Infof("Sync done, poll time taken: %v ms", int64(time.Since(t1)/time.Millisecond))
 	}
 }
+
 func (c *TranslClient) OnceRun(q *queue.PriorityQueue, once chan struct{}, w *sync.WaitGroup, subscribe *gnmipb.SubscriptionList) {
-	rc, ctx := common_utils.GetContext(c.ctx)
-	c.ctx = ctx
 	c.w = w
 	defer c.w.Done()
+	defer recoverSubscribe(c)
+
 	c.q = q
 	c.channel = once
 
-	version := getBundleVersion(c.extensions)
-	if version != nil {
-		rc.BundleVersion = version
+	if err := c.parseVersion(); err != nil {
+		enqueFatalMsgTranslib(c, err.Error())
+		return
 	}
+
 	_, more := <-c.channel
 	if !more {
 		log.V(1).Infof("%v once channel closed, exiting onceDb routine", c)
+		enqueFatalMsgTranslib(c, "")
 		return
 	}
+
 	t1 := time.Now()
-	for gnmiPath, URIPath := range c.path2URI {
-		val, err := transutil.TranslProcessGet(URIPath, nil, c.ctx)
-		if err != nil {
-			return
-		}
-
-		if !subscribe.UpdatesOnly && val != nil {
-			spbv := &spb.Value{
-				Prefix:       c.prefix,
-				Path:         gnmiPath,
-				Timestamp:    time.Now().UnixNano(),
-				SyncResponse: false,
-				Val:          val,
-			}
-
-			c.q.Put(Value{spbv})
-			log.V(6).Infof("Added spbv #%v", spbv)
-		}
+	for _, gnmiPath := range c.path2URI {
+		ts := translSubscriber{client: c}
+		ts.doSample(gnmiPath)
 	}
 
-	c.q.Put(Value{
-		&spb.Value{
-			Timestamp:    time.Now().UnixNano(),
-			SyncResponse: true,
-		},
-	})
+	enqueueSyncMessage(c)
 	log.V(4).Infof("Sync done, once time taken: %v ms", int64(time.Since(t1)/time.Millisecond))
 
 }
