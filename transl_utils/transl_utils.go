@@ -15,6 +15,8 @@ import (
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 	"github.com/openconfig/ygot/ygot"
 	"github.com/sonic-net/sonic-gnmi/common_utils"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -100,9 +102,13 @@ func ConvertToURI(prefix, path *gnmipb.Path, opts ...pathutil.PathValidatorOpt) 
 func TranslProcessGet(uriPath string, op *string, ctx context.Context) (*gnmipb.TypedValue, error) {
 	var jv []byte
 	var data []byte
-	rc, _ := common_utils.GetContext(ctx)
+	rc, ctx := common_utils.GetContext(ctx)
 
-	req := translib.GetRequest{Path:uriPath, User: translib.UserRoles{Name: rc.Auth.User, Roles: rc.Auth.Roles}}
+	req := translib.GetRequest{
+		Path: uriPath,
+		User: translib.UserRoles{Name: rc.Auth.User, Roles: rc.Auth.Roles},
+		Ctxt: ctx,
+	}
 	if rc.BundleVersion != nil {
 		nver, err := translib.NewVersion(*rc.BundleVersion)
 		if err != nil {
@@ -126,7 +132,6 @@ func TranslProcessGet(uriPath string, op *string, ctx context.Context) (*gnmipb.
 	dst := new(bytes.Buffer)
 	json.Compact(dst, data)
 	jv = dst.Bytes()
-
 
 	/* Fill the values into GNMI data structures . */
 	return &gnmipb.TypedValue{
@@ -192,7 +197,6 @@ func TranslProcessReplace(prefix *gnmipb.Path, entry *gnmipb.Update, ctx context
 		log.V(2).Infof("REPLACE operation failed with error =%v, %v", resp.ErrSrc, err1.Error())
 		return err1
 	}
-
 
 	return nil
 }
@@ -406,4 +410,74 @@ func isTranslibSuccess(err error) bool {
         }
 
         return true
+}
+
+// ToStatus returns a gRPC status object for a translib error.
+func ToStatus(err error) *status.Status {
+	if err == nil {
+		return nil
+	}
+
+	log.V(3).Infof("Translib error type=%T; value=%v", err, err)
+	code := codes.Unknown
+	data := "Operation failed"
+	var s *status.Status
+
+	switch err := err.(type) {
+	case tlerr.TranslibSyntaxValidationError:
+		code = codes.InvalidArgument
+		data = err.ErrorStr.Error()
+	case tlerr.TranslibUnsupportedClientVersion, tlerr.InvalidArgsError, tlerr.NotSupportedError:
+		code = codes.InvalidArgument
+		data = err.Error()
+	case tlerr.InternalError:
+		code = codes.Internal
+		data = err.Error()
+	case tlerr.NotFoundError:
+		code = codes.NotFound
+		data = err.Error()
+	case tlerr.AlreadyExistsError:
+		code = codes.AlreadyExists
+		data = err.Error()
+	case tlerr.TranslibCVLFailure:
+		code = codes.InvalidArgument
+		data = err.CVLErrorInfo.ConstraintErrMsg
+		if len(data) == 0 {
+			data = "Validation failed"
+		}
+	case tlerr.TranslibTransactionFail:
+		code = codes.Aborted
+		data = "Transaction failed. Please try again"
+	case tlerr.TranslibDBLock:
+		if err.Type == tlerr.DBLockConfigSession {
+			code = codes.FailedPrecondition
+			data = "Config Session is in progress. Please commit or abort the config session and try again"
+		} else {
+			code = codes.Aborted
+			data = "Another configuration is in progress. Please try again"
+		}
+	case tlerr.TranslibDBTxCmdsLim:
+		code = codes.ResourceExhausted
+		data = "Transaction cache limit reached"
+	case tlerr.TranslibRedisClientEntryNotExist:
+		code = codes.NotFound
+		data = "Resource not found"
+	case tlerr.AuthorizationError:
+		code = codes.PermissionDenied
+		data = err.Error()
+	case tlerr.RequestContextCancelledError:
+		s = status.FromContextError(err.CtxError)
+	case interface{ GRPCStatus() *status.Status }:
+		s = err.GRPCStatus()
+	default:
+		s = status.FromContextError(err)
+	}
+
+	if s == nil {
+		s = status.New(code, data)
+	}
+	if log.V(3) {
+		log.Infof("gRPC status code=%v; msg=%v", s.Code(), s.Message())
+	}
+	return s
 }

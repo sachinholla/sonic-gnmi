@@ -89,7 +89,7 @@ func (c *TranslClient) Get(w *sync.WaitGroup) ([]*spb.Value, error) {
 		val, err := transutil.TranslProcessGet(URIPath, nil, c.ctx)
 
 		if err != nil {
-			return nil, err
+			return nil, transutil.ToStatus(err).Err()
 		}
 
 		/* Value of each path is added to spb value structure. */
@@ -114,22 +114,27 @@ func (c *TranslClient) Set(delete []*gnmipb.Path, replace []*gnmipb.Update, upda
 	rc, ctx := common_utils.GetContext(c.ctx)
 	c.ctx = ctx
 	version := getBundleVersion(c.extensions)
+	var err error
 	if version != nil {
 		rc.BundleVersion = version
 	}
 
 	if (len(delete) + len(replace) + len(update)) > 1 {
-		return transutil.TranslProcessBulk(delete, replace, update, c.prefix, c.ctx)
+		err = transutil.TranslProcessBulk(delete, replace, update, c.prefix, c.ctx)
 	} else {
 		if len(delete) == 1 {
-			return transutil.TranslProcessDelete(c.prefix, delete[0], c.ctx)
+			err = transutil.TranslProcessDelete(c.prefix, delete[0], c.ctx)
 		}
 		if len(replace) == 1 {
-			return transutil.TranslProcessReplace(c.prefix, replace[0], c.ctx)
+			err = transutil.TranslProcessReplace(c.prefix, replace[0], c.ctx)
 		}
 		if len(update) == 1 {
-			return transutil.TranslProcessUpdate(c.prefix, update[0], c.ctx)
+			err = transutil.TranslProcessUpdate(c.prefix, update[0], c.ctx)
 		}
+	}
+
+	if err != nil {
+		err = transutil.ToStatus(err).Err()
 	}
 	return nil
 }

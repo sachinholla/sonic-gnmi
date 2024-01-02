@@ -4,26 +4,27 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net"
+	"strings"
+	"sync"
+
 	"github.com/Azure/sonic-mgmt-common/translib"
-	"github.com/sonic-net/sonic-gnmi/common_utils"
-	spb "github.com/sonic-net/sonic-gnmi/proto"
-	spb_gnoi "github.com/sonic-net/sonic-gnmi/proto/gnoi"
-	spb_jwt_gnoi "github.com/sonic-net/sonic-gnmi/proto/gnoi/jwt"
-	sdc "github.com/sonic-net/sonic-gnmi/sonic_data_client"
 	log "github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 	gnmi_extpb "github.com/openconfig/gnmi/proto/gnmi_ext"
 	gnoi_system_pb "github.com/openconfig/gnoi/system"
+	"github.com/sonic-net/sonic-gnmi/common_utils"
+	spb "github.com/sonic-net/sonic-gnmi/proto"
+	spb_gnoi "github.com/sonic-net/sonic-gnmi/proto/gnoi"
+	spb_jwt_gnoi "github.com/sonic-net/sonic-gnmi/proto/gnoi/jwt"
+	sdc "github.com/sonic-net/sonic-gnmi/sonic_data_client"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
-	"net"
-	"strings"
-	"sync"
 )
 
 var (
@@ -373,7 +374,7 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 	spbValues, err := dc.Get(nil)
 	if err != nil {
 		common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
-		return nil, status.Error(codes.NotFound, err.Error())
+		return nil, toGrpcError(err, codes.NotFound)
 	}
 
 	for index, spbValue := range spbValues {
@@ -492,6 +493,7 @@ func (s *Server) Set(ctx context.Context, req *gnmipb.SetRequest) (*gnmipb.SetRe
 	err = dc.Set(req.GetDelete(), req.GetReplace(), req.GetUpdate())
 	if err != nil {
 		common_utils.IncCounter(common_utils.GNMI_SET_FAIL)
+		err = toGrpcError(err, codes.Internal)
 	}
 
 	return &gnmipb.SetResponse{
@@ -617,4 +619,13 @@ func ReqFromMasterEnabledMA(req *gnmipb.SetRequest, masterEID *uint128) error {
 // is disabled.
 func ReqFromMasterDisabledMA(req *gnmipb.SetRequest, masterEID *uint128) error {
 	return nil
+}
+
+// toGrpcError creates a gRPC status error from an error object if it was
+// not a gRPC status error already.
+func toGrpcError(err error, code codes.Code) error {
+	if _, ok := err.(interface{ GRPCStatus() *status.Status }); ok {
+		return err
+	}
+	return status.Error(code, err.Error())
 }

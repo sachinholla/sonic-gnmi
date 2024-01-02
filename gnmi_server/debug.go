@@ -61,7 +61,7 @@ func (srv *Server) GetSubscribePreferences(req *spb_gnoi.SubscribePreferencesReq
 		User:  translib.UserRoles{Name: rc.Auth.User, Roles: rc.Auth.Roles},
 	})
 	if err != nil {
-		return status.Error(codes.InvalidArgument, err.Error())
+		return transl_utils.ToStatus(err).Err()
 	}
 
 	// When the path supports on_change but some of its subpaths do not, extra entries
